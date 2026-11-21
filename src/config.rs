@@ -9,8 +9,11 @@ use windows_sys::Win32::Security::Cryptography::{
 };
 
 #[derive(Serialize, Deserialize, Default, Clone)]
+#[serde(default)]
 pub struct Config {
     pub email: String,
+    /// До этого момента (unix-секунды) входить нельзя: Apple перестал слать коды.
+    pub login_blocked_until: u64,
     pub ipatool: Option<PathBuf>,
     pub out_dir: Option<PathBuf>,
     /// DPAPI-шифрованный пароль хранилища ipatool, hex

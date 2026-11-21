@@ -2,6 +2,7 @@
 
 mod config;
 mod device;
+mod gsa;
 mod ipatool;
 mod store;
 
@@ -33,6 +34,7 @@ fn main() -> eframe::Result {
 enum Msg {
     Account(Result<(String, String), String>),
     Login(Result<ipatool::LoginResult, String>),
+    CodeRequest(Result<gsa::Start, gsa::StartError>),
     Search(Result<Vec<AppItem>, String>),
     Icon(u64, Option<egui::ColorImage>),
     JobStarted(u64),
@@ -119,8 +121,12 @@ struct App {
     password: String,
     code: String,
     need_code: bool,
+    code_by_sms: bool,
+    code_fails: u32,
     login_busy: bool,
     login_err: Option<String>,
+    /// не чаще одной просьбы прислать код в минуту
+    next_code_request: Instant,
 
     query: String,
     searching: bool,
@@ -165,8 +171,11 @@ impl App {
             password: String::new(),
             code: String::new(),
             need_code: false,
+            code_by_sms: false,
+            code_fails: 0,
             login_busy: false,
             login_err: None,
+            next_code_request: Instant::now(),
             query: String::new(),
             searching: false,
             search_err: None,
@@ -206,14 +215,48 @@ impl App {
         self.bg(move || Msg::Account(ipatool::account_info(&exe, &pp)));
     }
 
-    fn do_login(&mut self) {
+    /// Шаг 1: пароль → Apple сразу присылает код (как в Xcode). Ровно одна просьба за нажатие.
+    fn request_code(&mut self) {
+        if self.login_blocked().is_some() || Instant::now() < self.next_code_request {
+            return;
+        }
+        self.login_busy = true;
+        self.login_err = None;
+        self.code.clear();
+        self.code_fails = 0;
+        self.next_code_request = Instant::now() + Duration::from_secs(60);
+        self.cfg.email = self.email.trim().to_string();
+        self.cfg.save();
+        let (e, p) = (self.cfg.email.clone(), self.password.clone());
+        self.bg(move || Msg::CodeRequest(gsa::request_code(&e, &p)));
+    }
+
+    /// Шаг 2: ipatool входит один раз, сразу с кодом (или без кода, если Apple его не просил).
+    fn ipatool_login(&mut self) {
         let Some(exe) = self.ipatool.clone() else { return };
         self.login_busy = true;
         self.login_err = None;
-        self.cfg.email = self.email.trim().to_string();
-        self.cfg.save();
         let (pp, e, p, c) = (self.passphrase.clone(), self.cfg.email.clone(), self.password.clone(), self.code.trim().to_string());
         self.bg(move || Msg::Login(ipatool::login(&exe, &pp, &e, &p, &c)));
+    }
+
+    fn code_rejected(&mut self) {
+        self.code_fails += 1;
+        self.code.clear();
+        if self.code_fails >= 3 {
+            self.need_code = false;
+            self.login_err = Some("Apple трижды не принял код. Подожди пару минут и войди заново".into());
+        } else {
+            self.need_code = true;
+            self.login_err = Some(
+                "Apple не принял код. Возьми свежий: на айфоне Настройки → твоё имя → Вход и безопасность → «Получить код проверки»".into(),
+            );
+        }
+    }
+
+    fn login_blocked(&self) -> Option<u64> {
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        (self.cfg.login_blocked_until > now).then(|| self.cfg.login_blocked_until - now)
     }
 
     fn do_search(&mut self) {
@@ -300,19 +343,42 @@ impl App {
                         Err(_) => AuthState::LoggedOut,
                     }
                 }
+                Msg::CodeRequest(r) => {
+                    self.login_busy = false;
+                    match r {
+                        Ok(gsa::Start::CodeOnDevices) => {
+                            self.need_code = true;
+                            self.code_by_sms = false;
+                        }
+                        Ok(gsa::Start::CodeBySms) => {
+                            self.need_code = true;
+                            self.code_by_sms = true;
+                        }
+                        Ok(gsa::Start::NoCode) => self.ipatool_login(),
+                        Err(gsa::StartError::RateLimited) => {
+                            let now = std::time::SystemTime::now()
+                                .duration_since(std::time::UNIX_EPOCH)
+                                .map(|d| d.as_secs())
+                                .unwrap_or(0);
+                            self.cfg.login_blocked_until = now + 3 * 3600;
+                            self.cfg.save();
+                            self.login_err = Some("Apple временно не присылает коды на этот Apple ID. Вход закрыт на 3 часа, чтобы аккаунт не заблокировали".into());
+                        }
+                        Err(gsa::StartError::Other(e)) => self.login_err = Some(e),
+                    }
+                }
                 Msg::Login(r) => {
                     self.login_busy = false;
                     match r {
-                        Ok(ipatool::LoginResult::NeedCode) => {
-                            self.need_code = true;
-                            self.login_err = None;
-                        }
                         Ok(ipatool::LoginResult::Ok { name, email }) => {
                             self.auth = AuthState::LoggedIn { name, email };
                             self.password.clear();
                             self.code.clear();
                             self.need_code = false;
                         }
+                        // повторно не пробуем — только по новому коду от человека
+                        Ok(ipatool::LoginResult::NeedCode) => self.code_rejected(),
+                        Err(e) if e.contains("Неверная почта") && self.need_code => self.code_rejected(),
                         Err(e) => self.login_err = Some(e),
                     }
                 }
@@ -450,7 +516,11 @@ impl App {
             let mut submit = false;
             if self.need_code {
                 ui.add_space(10.0);
-                ui.label("Apple отправил код на твои устройства. Введи его:");
+                ui.label(if self.code_by_sms {
+                    "Apple отправил код по SMS. Введи его:"
+                } else {
+                    "Apple отправил код на твой айфон (или мак). Нажми там «Разрешить» и введи код:"
+                });
                 let r = ui.add_enabled(
                     !busy,
                     egui::TextEdit::singleline(&mut self.code).hint_text("Код из 6 цифр").desired_width(f32::INFINITY),
@@ -461,8 +531,25 @@ impl App {
             }
 
             ui.add_space(12.0);
-            let ready = !self.email.trim().is_empty() && !self.password.is_empty() && (!self.need_code || self.code.trim().len() >= 6);
-            let label = if busy { "Входим… (первый раз до пары минут)" } else if self.need_code { "Подтвердить" } else { "Войти" };
+            let blocked = self.login_blocked();
+            let wait = self.next_code_request.saturating_duration_since(Instant::now()).as_secs();
+            let filled = !self.email.trim().is_empty() && !self.password.is_empty();
+            let ready = if self.need_code {
+                self.code.chars().filter(|c| c.is_ascii_digit()).count() == 6
+            } else {
+                filled && blocked.is_none() && wait == 0
+            };
+            let label = if busy {
+                "Входим… (первый раз до пары минут)".to_string()
+            } else if self.need_code {
+                "Подтвердить".to_string()
+            } else if let Some(s) = blocked {
+                format!("Вход закрыт ещё {} мин", s.div_ceil(60))
+            } else if wait > 0 {
+                format!("Войти можно через {wait} с")
+            } else {
+                "Войти".to_string()
+            };
             if ui
                 .add_enabled(ready && !busy, egui::Button::new(RichText::new(label).size(16.0)).min_size(Vec2::new(360.0, 36.0)))
                 .clicked()
@@ -470,27 +557,27 @@ impl App {
                 submit = true;
             }
             if submit && ready && !busy {
-                self.do_login();
+                if self.need_code {
+                    self.ipatool_login();
+                } else {
+                    self.request_code();
+                }
             }
             if busy {
                 ui.add_space(8.0);
                 ui.spinner();
             }
-            if self.need_code && !busy {
-                ui.add_space(6.0);
+            if self.need_code && !busy && ui.link("Изменить почту или пароль").clicked() {
+                self.need_code = false;
+                self.code.clear();
+            }
+            if !self.need_code && !busy {
+                ui.add_space(8.0);
                 ui.label(
-                    RichText::new("Код не пришёл? Apple шлёт его только при верном пароле. Проверь пароль и отправь ещё раз.")
+                    RichText::new("Вводи пароль внимательно: за частые попытки входа Apple может заблокировать Apple ID.")
                         .size(13.0)
                         .color(Color32::GRAY),
                 );
-                if ui.link("Отправить код ещё раз").clicked() {
-                    self.code.clear();
-                    self.do_login();
-                }
-                if ui.link("Изменить почту или пароль").clicked() {
-                    self.need_code = false;
-                    self.code.clear();
-                }
             }
             if let Some(e) = &self.login_err {
                 ui.add_space(8.0);
@@ -790,7 +877,9 @@ impl eframe::App for App {
             Tab::Download => self.download_tab(ui),
             Tab::Install => self.install_tab(ui),
         });
-        if self.jobs.values().any(|j| matches!(j.state, JobState::Running)) || self.login_busy || self.searching {
+        let login_timer = !matches!(self.auth, AuthState::LoggedIn { .. })
+            && (Instant::now() < self.next_code_request || self.login_blocked().is_some());
+        if self.jobs.values().any(|j| matches!(j.state, JobState::Running)) || self.login_busy || self.searching || login_timer {
             self.ctx.request_repaint_after(Duration::from_millis(300));
         }
     }

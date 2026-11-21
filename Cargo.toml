@@ -8,10 +8,20 @@ eframe = { version = "0.37", default-features = false, features = ["default_font
 idevice = { version = "0.1.68", default-features = false, features = ["ring", "usbmuxd", "afc", "installation_proxy", "springboardservices"] }
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
 plist = "1.10.4"
+plume_core = { git = "https://github.com/khcrysalis/Impactor", rev = "b13d99559febd63e3710dfdd0ef8cdd78d10ae13", version = "2.7.2", features = ["tweaks"] }
 rfd = "0.18.0"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 tokio = { version = "1.54.1", features = ["rt-multi-thread", "fs", "macros"] }
 ureq = { version = "3", features = ["json"] }
 windows-sys = { version = "0.61.2", features = ["Win32_Security_Cryptography", "Win32_Foundation", "Win32_System_Threading"] }
 zip = "9.8.1"
+
+# Anisette ?? ?????????????????? TLS (?? ?????????????????? ??????????????????) ??? vendor/omnisette/PATCH.md
+[patch."https://github.com/khcrysalis/Impactor"]
+omnisette = { path = "vendor/omnisette" }
+
+# plume_core ????? ?????? apple-codesign ?? ???? ?? Impactor
+[patch.crates-io]
+apple-codesign = { git = "https://github.com/khcrysalis/Impactor", rev = "b13d99559febd63e3710dfdd0ef8cdd78d10ae13" }
